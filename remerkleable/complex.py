@@ -762,7 +762,18 @@ def get_field_val_repr(self: View, fkey: str, ftype: Type[View]) -> str:
 
 
 class Container(_ContainerBase):
+    _fields: Dict[str, Type[View]]
+    _field_keys: tuple[str, ...]
+    _field_types: tuple[Type[View], ...]
     _field_indices: Dict[str, int]
+
+    _is_fixed_size: bool
+    _tree_depth: int
+    _fixed_part_len: int
+    _dyn_field_indices: tuple[int, ...]
+    _min_byte_length: int
+    _max_byte_length: int
+    _key_to_static_gindex: Dict[Any, Gindex]
     __slots__ = '_field_indices'
 
     def __new__(cls, *args, backing: Optional[Node] = None, hook: Optional[ViewHook] = None,
@@ -799,9 +810,74 @@ class Container(_ContainerBase):
 
     def __init_subclass__(cls, *args, **kwargs):
         super().__init_subclass__(*args, **kwargs)
-        cls._field_indices = {fkey: i for i, fkey in enumerate(cls.fields())}
-        if len(cls._field_indices) == 0:
-            raise Exception(f"Container {cls.__name__} must have at least one field!")
+        cls._build_class_cache()
+
+    @classmethod
+    def _build_class_cache(cls) -> None:
+        # Build fields once (same semantics as original Container.fields()).
+        fields: Dict[str, Type[View]] = {}
+        for b in cls.__bases__:
+            base_fields = getattr(b, "_fields", None)
+            if base_fields is None:
+                # fallback for non-Container bases
+                base_fields = b.fields() if hasattr(b, "fields") else {}
+            for k, v in base_fields.items():
+                fields[k] = v
+
+        ann = getattr(cls, "__annotations__", {})
+        for k, v in ann.items():
+            if k and k[0] != "_":
+                fields[k] = v
+
+        # IMPORTANT CHANGE:
+        # Do NOT raise if empty. Allow abstract/intermediate container types.
+        cls._fields = fields
+        cls._field_keys = tuple(fields.keys())
+        cls._field_types = tuple(fields.values())
+        cls._field_indices = {k: i for i, k in enumerate(cls._field_keys)}
+
+        # Empty-safe metadata
+        if not cls._field_keys:
+            cls._is_fixed_size = True
+            cls._fixed_part_len = 0
+            cls._dyn_field_indices = ()
+            cls._min_byte_length = 0
+            cls._max_byte_length = 0
+            cls._tree_depth = 0
+            cls._key_to_static_gindex = {}
+            return
+
+        # Normal (non-empty) computation
+        is_fixed = True
+        fixed_part_len = 0
+        dyn_indices: PyList[int] = []
+        min_len = 0
+        max_len = 0
+
+        for i, ftyp in enumerate(cls._field_types):
+            f_fixed = ftyp.is_fixed_byte_length()
+            if not f_fixed:
+                is_fixed = False
+                fixed_part_len += OFFSET_BYTE_LENGTH
+                dyn_indices.append(i)
+            else:
+                fixed_part_len += ftyp.type_byte_length()
+
+            if not f_fixed:
+                min_len += OFFSET_BYTE_LENGTH
+                max_len += OFFSET_BYTE_LENGTH
+            min_len += ftyp.min_byte_length()
+            max_len += ftyp.max_byte_length()
+
+        cls._is_fixed_size = is_fixed
+        cls._fixed_part_len = fixed_part_len
+        cls._dyn_field_indices = tuple(dyn_indices)
+        cls._min_byte_length = min_len
+        cls._max_byte_length = max_len
+
+        cls._tree_depth = get_depth(len(cls._field_keys))
+        depth = cls._tree_depth
+        cls._key_to_static_gindex = {k: to_gindex(i, depth) for i, k in enumerate(cls._field_keys)}
 
     @classmethod
     def coerce_view(cls: Type[CV], v: Any) -> CV:
@@ -809,18 +885,11 @@ class Container(_ContainerBase):
 
     @classmethod
     def fields(cls) -> Fields:
-        fields = {}
-        for b in cls.__bases__:
-            for k, v in b.fields().items():
-                fields[k] = v
-        for k, v in cls.__annotations__.items():
-            if k[0] != '_':
-                fields[k] = v  # if the key exists, overwrite it. Otherwise it extends the (ordered) dict.
-        return fields
+        return cls._fields  # type: ignore[return-value]
 
     @classmethod
     def is_fixed_byte_length(cls) -> bool:
-        return all(f.is_fixed_byte_length() for f in cls.fields().values())
+        return cls._is_fixed_size
 
     @classmethod
     def type_byte_length(cls) -> int:
@@ -831,21 +900,11 @@ class Container(_ContainerBase):
 
     @classmethod
     def min_byte_length(cls) -> int:
-        total = 0
-        for ftyp in cls.fields().values():
-            if not ftyp.is_fixed_byte_length():
-                total += OFFSET_BYTE_LENGTH
-            total += ftyp.min_byte_length()
-        return total
+        return cls._min_byte_length
 
     @classmethod
     def max_byte_length(cls) -> int:
-        total = 0
-        for ftyp in cls.fields().values():
-            if not ftyp.is_fixed_byte_length():
-                total += OFFSET_BYTE_LENGTH
-            total += ftyp.max_byte_length()
-        return total
+        return cls._max_byte_length
 
     @classmethod
     def is_packed(cls) -> bool:
@@ -853,29 +912,26 @@ class Container(_ContainerBase):
 
     @classmethod
     def tree_depth(cls) -> int:
-        return get_depth(len(cls.fields()))
+        return cls._tree_depth
 
     @classmethod
     def item_elem_cls(cls, i: int) -> Type[View]:
-        return list(cls.fields().values())[i]
+        return cls._field_types[i]
 
     @classmethod
     def default_node(cls) -> Node:
         return subtree_fill_to_contents([field.default_node() for field in cls.fields().values()], cls.tree_depth())
 
     def value_byte_length(self) -> int:
-        if self.__class__.is_fixed_byte_length():
-            return self.__class__.type_byte_length()
-        else:
-            total = 0
-            fields = self.fields()
-            for fkey, ftyp in fields.items():
-                if ftyp.is_fixed_byte_length():
-                    total += ftyp.type_byte_length()
-                else:
-                    total += OFFSET_BYTE_LENGTH
-                    total += cast(View, getattr(self, fkey)).value_byte_length()
-            return total
+        cls = self.__class__
+        if cls._is_fixed_size:
+            return cls.type_byte_length()  # or cls._min_byte_length
+
+        total = cls._fixed_part_len
+        for i in cls._dyn_field_indices:
+            v = cast(View, super().get(i))
+            total += v.value_byte_length()
+        return total
 
     def __getattr__(self, item):
         if item[0] == '_':
@@ -913,9 +969,8 @@ class Container(_ContainerBase):
         return tuple((fkey, ftype.type_tree_shape()) for fkey, ftype in cls.fields().items())
 
     def __iter__(self):
-        tree_depth = self.tree_depth()
-        backing = self.get_backing()
-        return ContainerElemIter(backing, tree_depth, list(self.__class__.fields().values()))
+        cls = self.__class__
+        return ContainerElemIter(self.get_backing(), cls._tree_depth, cls._field_types)
 
     @classmethod
     def decode_bytes(cls: Type[V], bytez: bytes) -> V:
@@ -995,12 +1050,10 @@ class Container(_ContainerBase):
 
     @classmethod
     def key_to_static_gindex(cls, key: Any) -> Gindex:
-        fields = cls.fields()
         try:
-            field_index = list(fields.keys()).index(key)
-        except ValueError:  # list.index raises ValueError if the element (a key here) is missing
+            return cls._key_to_static_gindex[key]
+        except KeyError:
             raise KeyError
-        return to_gindex(field_index, cls.tree_depth())
 
     @classmethod
     def navigate_type(cls, key: Any) -> Type[View]:
@@ -1016,3 +1069,4 @@ class Container(_ContainerBase):
 
     def __hash__(self):
         return hash((self.hash_tree_root(), len(self.fields())))
+Container._build_class_cache()

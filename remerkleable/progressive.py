@@ -5,7 +5,8 @@
 
 from collections import defaultdict
 from functools import lru_cache
-from typing import Any, BinaryIO, Dict, Iterator, Literal, Optional, Sequence, Tuple, Type, TypeVar, Union
+from typing import Any, BinaryIO, Dict, Iterator, Literal, Optional, Sequence, Tuple, \
+    Type, TypeVar, Union, cast
 from types import GeneratorType
 from textwrap import indent
 import io
@@ -588,6 +589,45 @@ class ProgressiveContainer(Container):
         field_index = cls._field_indices[key]
         return cls.chunk_to_gindex(field_index)
 
+    @classmethod
+    def is_fixed_byte_length(cls) -> bool:
+        # Only user-declared fields are in cls.fields(); progressive metadata is not serialized.
+        return all(t.is_fixed_byte_length() for t in cls.fields().values())
+
+    @classmethod
+    def min_byte_length(cls) -> int:
+        total = 0
+        for t in cls.fields().values():
+            if not t.is_fixed_byte_length():
+                total += OFFSET_BYTE_LENGTH
+            total += t.min_byte_length()
+        return total
+
+    @classmethod
+    def max_byte_length(cls) -> int:
+        total = 0
+        for t in cls.fields().values():
+            if not t.is_fixed_byte_length():
+                total += OFFSET_BYTE_LENGTH
+            total += t.max_byte_length()
+        return total
+
+    def value_byte_length(self) -> int:
+        cls = self.__class__
+
+        # Compute based on declared fields only (progressive metadata is not part of SSZ bytes).
+        if cls.is_fixed_byte_length():
+            # For fixed progressive containers, min == type byte length.
+            return cls.min_byte_length()
+
+        total = 0
+        for fkey, ftyp in cls.fields().items():
+            if ftyp.is_fixed_byte_length():
+                total += ftyp.type_byte_length()
+            else:
+                total += OFFSET_BYTE_LENGTH
+                total += cast(View, getattr(self, fkey)).value_byte_length()
+        return total
 
 @lru_cache(maxsize=None)
 def merge_shapes(shapes: frozenset) -> Any:
